@@ -211,3 +211,56 @@ func main() {
         VALUES (:first_name, :last_name, :email)`, personMaps)
 }
 ```
+
+## scanning joined rows into parent/child structs
+
+A JOIN returns one row per matched child, so each parent repeats on many
+lines. `ScanGroups` consumes such a result and assembles a slice of parent
+structs holding a slice of child structs. Columns are matched by name
+(through the same Mapper used by `StructScan`, including `db` tags), so the
+order of the SELECT list is irrelevant:
+
+```go
+type Author struct {
+    AuthorID int64  `db:"author_id"`
+    Name     string `db:"name"`
+    Books    []Book
+}
+
+type Book struct {
+    BookID int64  `db:"book_id"`
+    Title  string `db:"title"`
+}
+
+rows, err := db.Queryx(`
+    SELECT a.id AS "author.author_id", a.name AS "author.name",
+           b.id AS "book.book_id", b.title AS "book.title"
+      FROM author a
+      LEFT JOIN book b ON b.author_id = a.id`)
+if err != nil {
+    log.Fatalln(err)
+}
+defer rows.Close() // ScanGroups does not close rows; the caller does
+
+var authors []Author
+err = rows.ScanGroups(&authors, sqlx.GroupConfig{
+    ParentPrefix: "author",
+    ChildPrefix:  "book",
+    ParentKeys:   []string{"author.author_id"},
+    ChildKeys:    []string{"book.book_id"},
+})
+```
+
+Notes:
+
+* Keys may consist of several columns (`ParentKeys`/`ChildKeys` accept a
+  list), and a NULL key is distinguished from a zero-valued key.
+* First-seen order is kept for parents and for each parent's children;
+  identical duplicate rows collapse into one child, while the same key with
+  differing non-key columns returns an error.
+* A LEFT JOIN row whose child columns are all NULL creates no child object.
+* Errors while iterating carry the 1-based row number
+  (`*sqlx.GroupRowError`), and the destination is only written after every
+  row succeeds, so a failed scan never leaves a half-built result.
+* `ScanGroups` never closes `Rows`; deferring `rows.Close()` is the caller's
+  responsibility.
