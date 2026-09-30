@@ -131,3 +131,33 @@ func NamedExecContext(ctx context.Context, e ExtContext, query string, arg inter
 	}
 	return e.ExecContext(ctx, q, args...)
 }
+
+// NamedExecBatchesContext executes a named INSERT ... VALUES (...) template
+// for a slice of struct or map rows, splitting the rows into batches that
+// respect the driver's bind parameter style and the maxParams parameter
+// budget.  The budget accounts for the parameters repeated per row inside
+// the VALUES tuple (including repeated names) as well as fixed parameters
+// appearing elsewhere in the statement;  fixed parameters are bound from the
+// first row of each batch.  Numbered bind styles (such as postgres' $1) are
+// numbered from 1 in every batch.
+//
+// Every row is bound before the first statement is executed, so a binding
+// error guarantees that no SQL is sent.  The batches are executed on e, so
+// when e is a *sqlx.Tx the whole batch runs inside the caller's transaction.
+// It returns one sql.Result per executed batch;  if a batch fails, the
+// results of the batches executed so far are returned along with the error.
+func NamedExecBatchesContext(ctx context.Context, e ExtContext, query string, arg interface{}, maxParams int) ([]sql.Result, error) {
+	batches, err := bindNamedBatches(BindType(e.DriverName()), query, arg, mapperFor(e), maxParams)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]sql.Result, 0, len(batches))
+	for _, b := range batches {
+		res, err := e.ExecContext(ctx, b.query, b.args...)
+		if err != nil {
+			return results, err
+		}
+		results = append(results, res)
+	}
+	return results, nil
+}
