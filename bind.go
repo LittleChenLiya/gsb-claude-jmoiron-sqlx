@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -241,6 +242,176 @@ func In(query string, args ...interface{}) (string, []interface{}, error) {
 	}
 
 	return buf.String(), newArgs, nil
+}
+
+// InEmptyStrategy determines how InCon handles empty slice arguments.
+// The zero value (InEmptyReject) preserves the legacy In behavior.
+type InEmptyStrategy int
+
+const (
+	// InEmptyReject is the zero value and matches the legacy In behavior:
+	// an empty slice argument causes an error and no query is produced.
+	InEmptyReject InEmptyStrategy = iota
+	// InEmptyNull replaces the placeholder of an empty slice argument with
+	// the SQL NULL keyword and contributes no bind values, so a query like
+	// `WHERE id IN (?)` becomes `WHERE id IN (NULL)`.
+	InEmptyNull
+)
+
+// InOptions configures the behavior of InCon.
+type InOptions struct {
+	// Empty controls how empty slice arguments are handled.
+	Empty InEmptyStrategy
+}
+
+// InCon is a configurable version of In.  It expands slice values in args,
+// returning the modified query string and a new arg list that can be executed
+// by a database.  The query should use the `?` bindVar; the return value uses
+// the `?` bindVar as well.
+//
+// Unlike In, InCon always validates the query and arguments before producing
+// any output: the number of `?` placeholders (ignoring any `?` inside quoted
+// strings or identifiers) must match the number of arguments, and every empty
+// slice argument is resolved according to opts.Empty before a new query is
+// built.  When validation fails the returned query is empty and the arg list
+// is nil, so callers never observe a partially rewritten query; the input
+// args slice is never modified.
+//
+// Only genuine slice values are expanded: []byte stays a single value, and a
+// driver.Valuer is consulted exactly once to determine whether its value is a
+// slice.
+func InCon(query string, args []interface{}, opts InOptions) (string, []interface{}, error) {
+	// argMeta stores reflect.Value and length for slices and
+	// the value itself for non-slice arguments.
+	type argMeta struct {
+		v      reflect.Value
+		i      interface{}
+		length int
+	}
+
+	meta := make([]argMeta, len(args))
+	flatArgsCount := 0
+
+	// Pass 1: validate every argument and the placeholder count before
+	// producing any output.  A failure here returns an empty query and a nil
+	// arg list so callers never observe a partially rewritten query, and the
+	// input args slice is left untouched.
+	for i, arg := range args {
+		// A driver.Valuer is consulted exactly once; the returned value is
+		// what gets classified (and possibly expanded) below.  It is never
+		// called again to detect whether it is a slice.
+		if a, ok := arg.(driver.Valuer); ok {
+			var err error
+			arg, err = a.Value()
+			if err != nil {
+				return "", nil, fmt.Errorf("InCon: argument %d: %w", i, err)
+			}
+		}
+
+		if v, ok := asSliceForIn(arg); ok {
+			meta[i].length = v.Len()
+			meta[i].v = v
+			flatArgsCount += meta[i].length
+
+			if meta[i].length == 0 {
+				switch opts.Empty {
+				case InEmptyNull:
+					// NULL strategy: the placeholder is replaced by NULL and
+					// no bind values are contributed.
+				case InEmptyReject:
+					return "", nil, fmt.Errorf("InCon: empty slice passed to 'in' query at argument %d", i)
+				default:
+					return "", nil, fmt.Errorf("InCon: unknown empty-slice strategy %d", opts.Empty)
+				}
+			}
+		} else {
+			meta[i].i = arg
+			flatArgsCount++
+		}
+	}
+
+	// Count placeholders (ignoring '?' inside quoted strings/identifiers)
+	// and make sure they match the number of arguments.
+	bindVarCount := 0
+	for pos := nextPlaceholder(query, 0); pos != -1; pos = nextPlaceholder(query, pos+1) {
+		bindVarCount++
+	}
+	if bindVarCount != len(args) {
+		return "", nil, fmt.Errorf("InCon: number of bindVars (%d) does not match number of arguments (%d)", bindVarCount, len(args))
+	}
+
+	// Pass 2: build the new query and argument list.
+	newArgs := make([]interface{}, 0, flatArgsCount)
+
+	var buf strings.Builder
+	buf.Grow(len(query) + len(", ?")*flatArgsCount)
+
+	var argIdx int
+	offset := 0
+	for pos := nextPlaceholder(query, offset); pos != -1; pos = nextPlaceholder(query, offset) {
+		m := meta[argIdx]
+		argIdx++
+
+		// Write everything before the placeholder.
+		buf.WriteString(query[offset:pos])
+
+		switch {
+		case m.length > 0:
+			// Slice: expand into one placeholder per element.
+			buf.WriteByte('?')
+			for si := 1; si < m.length; si++ {
+				buf.WriteString(", ?")
+			}
+			newArgs = appendReflectSlice(newArgs, m.v, m.length)
+		case m.v.IsValid():
+			// Empty slice with the NULL strategy: a single SQL NULL, no args.
+			buf.WriteString("NULL")
+		default:
+			// Scalar value.
+			buf.WriteByte('?')
+			newArgs = append(newArgs, m.i)
+		}
+
+		offset = pos + 1
+	}
+	buf.WriteString(query[offset:])
+
+	return buf.String(), newArgs, nil
+}
+
+// nextPlaceholder returns the index of the next '?' placeholder at or after
+// start that is not inside a quoted string literal or quoted identifier.
+// Single-quoted strings, double-quoted strings/identifiers and backtick
+// identifiers are all recognized; a doubled quote escapes itself, and a
+// backslash escapes the following character (MySQL style).
+func nextPlaceholder(query string, start int) int {
+	var quote byte // 0 means unquoted
+	for i := start; i < len(query); i++ {
+		c := query[i]
+		if quote != 0 {
+			if c == '\\' && i+1 < len(query) {
+				// Backslash escapes the next character (e.g. '\'' in MySQL).
+				i++
+				continue
+			}
+			if c == quote {
+				if i+1 < len(query) && query[i+1] == quote {
+					// Doubled quote is an escaped quote (e.g. 'it''s').
+					i++
+					continue
+				}
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"', '`':
+			quote = c
+		case '?':
+			return i
+		}
+	}
+	return -1
 }
 
 func appendReflectSlice(args []interface{}, v reflect.Value, vlen int) []interface{} {

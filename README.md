@@ -211,3 +211,43 @@ func main() {
         VALUES (:first_name, :last_name, :email)`, personMaps)
 }
 ```
+
+## `in` queries
+
+sqlx.In expands slice arguments into the list of placeholders required by an
+`IN (...)` clause.  The query must use `?` bind variables:
+
+```go
+query, args, err := sqlx.In("SELECT * FROM place WHERE telcode IN (?) ORDER BY telcode", []int{852, 65})
+// query == "SELECT * FROM place WHERE telcode IN (?, ?) ORDER BY telcode"
+// args  == []interface{}{852, 65}
+```
+
+Only genuine slice values are expanded; `[]byte` stays a single value, and a
+`driver.Valuer` is consulted exactly once to determine whether its value is a
+slice.  A `?` inside a quoted string or identifier is left untouched.
+
+### Empty slices with `InCon`
+
+The legacy `In` rejects empty slices with an error.  `InCon` is a configurable
+entry point that lets the caller choose what happens to an empty slice:
+
+```go
+// InEmptyNull replaces the placeholder with a single SQL NULL and contributes
+// no bind values, so the query stays valid:
+q, args, err := sqlx.InCon("WHERE id IN (?) AND tag = ?",
+    []interface{}{[]int{}, "x"},
+    sqlx.InOptions{Empty: sqlx.InEmptyNull})
+// q     == "WHERE id IN (NULL) AND tag = ?"
+// args  == []interface{}{"x"}
+
+// InEmptyReject (the zero value, matching In) returns a diagnosable error:
+_, _, err = sqlx.InCon("WHERE id IN (?)",
+    []interface{}{[]int{}},
+    sqlx.InOptions{Empty: sqlx.InEmptyReject})
+// err == "InCon: empty slice passed to 'in' query at argument 0"
+```
+
+`InCon` validates the placeholder count and every empty-slice strategy before
+producing any output, so a failed call returns an empty query and a nil arg
+list and never modifies the input args slice.
