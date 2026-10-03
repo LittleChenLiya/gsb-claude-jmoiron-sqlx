@@ -44,6 +44,32 @@ new changes.  Compatibility beyond that is not guaranteed.
 Versioning is done with Go modules.  Breaking changes (eg. removing deprecated API)
 will get major version number bumps.
 
+### Configurable `IN` expansion with `InWithOptions`
+
+`sqlx.In` expands slice arguments into `?` bindvar lists and rejects empty
+slices.  `sqlx.InWithOptions` is an independent, configurable entry point
+that lets the caller explicitly choose how empty slices are handled:
+
+```go
+// EmptySliceError (the zero value) rejects empty slices, like In.
+// EmptySliceNull expands an empty slice to the SQL literal NULL instead.
+q, args, err := sqlx.InWithOptions(
+    "select * from users where id in (?) and tag=?",
+    sqlx.InOptions{EmptySlice: sqlx.EmptySliceNull},
+    []int{}, "admin",
+)
+// q    == "select * from users where id in (NULL) and tag=?"
+// args == []interface{}{"admin"}
+```
+
+`InWithOptions` validates everything before generating any SQL: each
+`driver.Valuer` argument is resolved exactly once, every empty slice is
+checked against the configured policy, and the number of `?` bindvars
+(ignoring `?` characters inside quoted string literals) is checked against
+the argument count.  On failure it returns an error and no partial query,
+and it never modifies the caller's argument slice.  Only real slices are
+expanded; `[]byte` remains a single value.
+
 ## install
 
     go get github.com/jmoiron/sqlx
