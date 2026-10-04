@@ -20,6 +20,16 @@ explains how to use `database/sql` along with sqlx.
 
 ## Recent Changes
 
+unreleased:
+
+* `sqlx.MapRows` row iterator (`NewMapRows`, `NewMapRowsReadOnly`,
+  `(*Rows).MapRows`): lazily yields each row as an independent
+  `map[string]interface{}` with a maximum row limit, copying `[]byte`
+  values so driver buffer reuse cannot corrupt previously returned maps.
+  The underlying rows are released exactly once at the limit, at
+  exhaustion, or on explicit `Close`; scan errors are kept primary with
+  close errors attached via `*ScanCloseError`.
+
 1.3.0:
 
 * `sqlx.DB.Connx(context.Context) *sqlx.Conn`
@@ -211,3 +221,36 @@ func main() {
         VALUES (:first_name, :last_name, :email)`, personMaps)
 }
 ```
+
+### iterating rows as independent maps
+
+For large result sets, `MapRows` yields one fresh `map[string]interface{}`
+per row without collecting all rows first.  `[]byte` values are copied, so
+driver buffer reuse cannot corrupt maps returned earlier.  The iterator
+takes a maximum row limit (`<= 0` for no limit) and releases the underlying
+rows exactly once when the limit is reached, the rows are exhausted, or
+`Close` is called:
+
+```go
+rows, err := db.Queryx("SELECT name, score FROM players")
+if err != nil {
+    log.Fatal(err)
+}
+it := sqlx.NewMapRows(rows, 100) // auto-close mode: iterator closes rows
+for {
+    row, err := it.Next()
+    if err != nil {
+        // a scan error is kept primary; any close error is attached
+        // behind it in a *sqlx.ScanCloseError, both errors.Is-able
+        log.Fatal(err)
+    }
+    if row == nil {
+        break // limit reached or result set exhausted
+    }
+    fmt.Println(row["name"], row["score"])
+}
+```
+
+Use `sqlx.NewMapRowsReadOnly` for the caller-held (read-only) mode, where
+the iterator never closes the rows and their lifecycle stays with the
+caller.  `MapScan` is unchanged.
