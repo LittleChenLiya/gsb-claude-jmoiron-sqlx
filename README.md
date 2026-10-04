@@ -170,6 +170,33 @@ func main() {
     // Place{Country:"Hong Kong", City:sql.NullString{String:"", Valid:false}, TelCode:852}
     // Place{Country:"Singapore", City:sql.NullString{String:"", Valid:false}, TelCode:65}
 
+    // Joins can produce duplicate column names, e.g. [id, id, name]. A plain
+    // StructScan silently points both "id" columns at the same field, so the
+    // values overwrite each other. CompileStructScan validates the column ->
+    // field mapping up front (strict by default), reporting every conflicting
+    // column position and the target field, and lets you resolve such conflicts
+    // by explicitly mapping each column ordinal. Compilation reads no rows.
+    type Membership struct {
+        ID     int64  `db:"id"`
+        UserID int64  `db:"user_id"`
+        TeamID int64  `db:"team_id"`
+        Name   string `db:"name"`
+    }
+    plan, err := sqlx.CompileStructScan((*Membership)(nil),
+        []string{"id", "id", "name"},
+        sqlx.WithColumnFields(
+            sqlx.ColumnField{Column: 0, Field: "user_id"},
+            sqlx.ColumnField{Column: 1, Field: "team_id"},
+        ))
+    if err != nil { log.Fatalln(err) }
+    rows, err = db.Queryx("SELECT users.id, teams.id, users.name FROM users JOIN teams ...")
+    for rows.Next() {
+        var m Membership
+        // on a conversion error, m keeps its old values: no half-updated struct
+        if err := plan.Scan(rows, &m); err != nil { log.Fatalln(err) }
+        fmt.Printf("%#v\n", m)
+    }
+
     // Named queries, using `:name` as the bindvar.  Automatic bindvar support
     // which takes into account the dbtype based on the driverName on sqlx.Open/Connect
     _, err = db.NamedExec(`INSERT INTO person (first_name,last_name,email) VALUES (:first,:last,:email)`, 
