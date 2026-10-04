@@ -211,3 +211,40 @@ func main() {
         VALUES (:first_name, :last_name, :email)`, personMaps)
 }
 ```
+
+## MapRows: row-by-row map iteration
+
+When reading a large result set, `MapRows` scans one row at a time into a fresh
+`map[string]interface{}` without first collecting every row into a slice of
+maps. Each call to `Map` returns a new map; `[]byte` values handed back by the
+driver are copied, so a driver that reuses a single byte buffer across scans
+cannot mutate maps already produced.
+
+`MapRows` takes a row limit and a mode:
+
+- `MapRowsAutoClose` releases the underlying rows automatically once the limit
+  is reached (Close may still be called afterwards and is idempotent).
+- `MapRowsHold` leaves the rows under the caller's control; they are released
+  only when `Close` is called explicitly.
+
+```go
+rows, err := db.Queryx("SELECT id, payload FROM big_table")
+if err != nil {
+    log.Fatalln(err)
+}
+
+// Auto-close mode: at most 100 rows, rows released automatically at the limit.
+it := rows.MapRows(100, sqlx.MapRowsAutoClose)
+defer it.Close()
+
+for it.Next() {
+    m := it.Map()
+    _ = m["id"]
+    _ = m["payload"]
+}
+```
+
+If both scanning and closing fail, `Close` returns a combined error that keeps
+the scan error first and appends the close error; both are reachable via
+`errors.Is` and `errors.As`.
+
